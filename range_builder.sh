@@ -491,88 +491,83 @@ JOIN
 ##############################################
 cat > playbooks/roles/windows-bootstrap/tasks/main.yml <<'WB'
 ---
-- name: Upload Custom Range Phase 3 Builder Script
+- name: Upload Phase 3 Builder Script
   ansible.windows.win_copy:
     src: Range-Phase3-Builder.ps1
     dest: C:\Range-Phase3-Builder.ps1
 
-- name: Setup Basic Hardened HTTPS WinRM Control Tunnel (Port 5986)
+- name: Ensure WinRM HTTP is configured and firewall open
   ansible.windows.win_shell: |
-    Set-Service WinRM -StartupType Automatic
-    Restart-Service WinRM -Force
-    $Cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My" -KeyLength 2048 -Provider "Microsoft RSA SChannel Cryptographic Provider" -Type "SSLServerAuthentication" -ErrorAction SilentlyContinue
-    winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
-    winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null
-    winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$($Cert.Thumbprint)`"}"
-    New-NetFirewallRule -Name "WINRM-HTTPS-FORCE" -DisplayName "WINRM-HTTPS-FORCE" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
-    Restart-Service WinRM -Force
+    winrm quickconfig -q
+    winrm set winrm/config/service '@{AllowUnencrypted="false"}'
+    winrm set winrm/config/service/auth '@{Basic="false";Kerberos="true";Negotiate="true"}'
+    if (-not (Get-NetFirewallRule -DisplayName "WinRM_HTTP_5985" -ErrorAction SilentlyContinue)) {
+      New-NetFirewallRule -DisplayName "WinRM_HTTP_5985" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 | Out-Null
+    }
+  args:
+    executable: powershell.exe
 
-- name: Wait for connection adapter stabilization
-  pause:
-    seconds: 10
-
-- name: Pivot connection variables dynamically to secure transport channel
-  set_fact:
-    ansible_port: 5986
-    ansible_winrm_transport: basic
-    ansible_winrm_server_cert_validation: ignore
-
-- name: Flush transport socket mapping engine
-  meta: reset_connection
-
-- name: Execute Phase 3 Builder — Domain Controller Custom Tasks
-  ansible.windows.win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 -Role DC -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
+- name: Execute Phase 3 Builder — DC role
+  ansible.windows.win_shell: |
+    powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 `
+      -Role DC `
+      -DomainFqdn "{{ domain_name }}" `
+      -CaHostname "ca01" `
+      -TemplateName "{{ cert_template }}"
   when: inventory_hostname == 'domain_controller'
 
-- name: Execute Phase 3 Builder — Certificate Authority Custom Tasks
-  ansible.windows.win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 -Role CA -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
+- name: Execute Phase 3 Builder — CA role
+  ansible.windows.win_shell: |
+    powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 `
+      -Role CA `
+      -DomainFqdn "{{ domain_name }}" `
+      -CaHostname "ca01" `
+      -TemplateName "{{ cert_template }}"
   when: inventory_hostname == 'certificate_authority'
 
-- name: Execute Phase 3 Builder — Member Systems Configuration and Pulse Autoenrollment
+- name: Execute Phase 3 Builder — Member role (Auto-Enroll & Create HTTPS Listener)
   ansible.windows.win_shell: |
-    # Configure firewalls and baseline services via the builder script framework
-    C:\Range-Phase3-Builder.ps1 -Role Member -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
+    # 1. Run baseline member configuration parameters (Firewalls, CredSSP)
+    powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 -Role Member -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
     
-    # Securely request structural Application PKI certificates locally via machine account context
+    # 2. Issue local Active Directory enrollment directives natively under machine token
     gpupdate.exe /force
     certutil.exe -pulse
     Get-Certificate -Template "{{ cert_template }}" -Url "LDAP:" -CertStoreLocation "Cert:\LocalMachine\My" -ErrorAction SilentlyContinue
+    
+    # 3. Provision the companion HTTPS listener alongside the baseline transport
+    $cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+        $_.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Enhanced Key Usage" -and $_.Format(0) -match "Server Authentication" }
+    } | Sort-Object NotBefore -Descending | Select-Object -First 1
+    
+    if ($cert) {
+        winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME.{{ domain_name }}`"; CertificateThumbprint=`"$($cert.Thumbprint)`"}"
+    } else {
+        throw "Failed to provision enterprise domain certificate securely"
+    }
   when: inventory_hostname != 'domain_controller' and inventory_hostname != 'certificate_authority'
-  async: 45
-  poll: 5
-  ignore_errors: yes
 
-- name: Core Connection Verification Check
+- name: Pivot connection variables to HTTPS
+  set_fact:
+    ansible_port: 5986
+    ansible_winrm_transport: credssp
+    ansible_winrm_server_cert_validation: ignore
+
+- name: Reset connection to use HTTPS listener
+  meta: reset_connection
+
+- name: Remove HTTP listener after HTTPS is live
+  ansible.windows.win_shell: |
+    winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
+  args:
+    executable: powershell.exe
+
+- name: Core connection verification
   win_ping:
 WB
 
-# Inject your exact Range-Phase3-Builder.ps1 script into the framework files payload
+# Inject your custom helper script safely into the files directory
 cat > playbooks/roles/windows-bootstrap/files/Range-Phase3-Builder.ps1 <<'PHASE3_SCRIPT'
-<#
-.SYNOPSIS
-  Cyber range Phase 3 builder:
-  - Preps CA
-  - Ensures machine certs
-  - Configures WinRM HTTP + HTTPS (5985/5986)
-  - Enables CredSSP (for double-hop)
-  - Opens firewall
-  - Validates SPNs
-
-.PARAMETER Role
-  'CA'     – runs CA/template/auto-enrollment prep
-  'Member' – runs machine cert enrollment + WinRM HTTPS + CredSSP
-  'DC'     – optional DC-specific prep (SPNs, GP refresh)
-
-.PARAMETER DomainFqdn
-  AD DNS name (e.g. lab.local)
-
-.PARAMETER CaHostname
-  Hostname of CA (e.g. CA01)
-
-.PARAMETER TemplateName
-  Name of the machine cert template (e.g. "Range-Machine")
-#>
-
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)]
@@ -686,39 +681,12 @@ function Invoke-CertAutoEnrollment {
     certutil.exe -pulse | Out-Null
 }
 
-function Get-MachineServerAuthCert {
-    param(
-        [string]$TemplateName
-    )
-
-    Write-Status "Searching for machine certificate from template '$TemplateName' with Server Authentication EKU"
-    $certs = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
-        $_.Extensions | Where-Object {
-            $_.Oid.FriendlyName -eq "Enhanced Key Usage" -and
-            $_.Format(0) -match "Server Authentication"
-        }
-    }
-
-    if (-not $certs) {
-        Write-Status "No Server Authentication certs found in LocalMachine\My. Attempting local registration context setup." "WARN"
-    }
-    return $certs
-}
-
 function Configure-WinRMHttp {
     Write-Status "Configuring WinRM HTTP listener (5985)"
     winrm quickconfig -quiet | Out-Null
     winrm set winrm/config/service '@{AllowUnencrypted="false"}' | Out-Null
     winrm set winrm/config/service/auth '@{Basic="false";Kerberos="true";Negotiate="true"}' | Out-Null
     Write-Status "WinRM HTTP configured"
-}
-
-function Configure-WinRMHttps {
-    param(
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert
-    )
-    # WinRM HTTPS tuning is managed cleanly via the primary Ansible automation pipeline
-    Write-Status "Bypassing destructive re-binding inside active session loop."
 }
 
 function Configure-CredSSP {
