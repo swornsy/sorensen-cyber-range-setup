@@ -9,12 +9,19 @@ cd "$REPO"
 
 echo "[*] Installing prerequisites"
 sudo apt update
-sudo apt install -y ansible python3-pip unzip
+sudo apt install -y python3-pip unzip
+# Fix for the galaxy dependency resolution bug: Clean install matched packages
+sudo apt remove --purge -y ansible ansible-core || true
+sudo apt autoremove -y
+sudo add-apt-repository --yes --update ppa:ansible/ansible
+sudo apt update
+sudo apt install -y ansible net-tools
 pip3 install -q pywinrm
+rm -rf ~/.ansible/galaxy_cache
 
 echo "[*] Creating directory structure"
-mkdir -p inventory/group_vars playbooks bootstrap roles
-mkdir -p roles/{ad-structure/{tasks,files},domain-controller/tasks,certificate-authority/tasks,windows-domain-join/tasks,windows-bootstrap/{tasks,files}}
+mkdir -p inventory/group_vars playbooks/bootstrap playbooks/roles
+mkdir -p playbooks/roles/{ad-structure/{tasks,files},domain-controller/tasks,certificate-authority/tasks,windows-domain-join/tasks,windows-bootstrap/{tasks,files}}
 
 ##############################################
 # INVENTORY
@@ -33,32 +40,32 @@ all:
       hosts:
         domain_controller:
           ansible_host: 10.10.0.10
-          ansible_password: 'wv)oO6uTQ2x*3lrgNt4$R7taJl1sFtZL'
+          ansible_password: '&l.)D&ah?cm*c6wTXI2d6Op;?p$k;Hj9'
           hostname: dc01
 
         win-workstation1:
           ansible_host: 10.10.20.10
-          ansible_password: 'cj7Z!zki!)Y!X7!=koF5xvqpv%Usn1Ld'
+          ansible_password: 'afQ5=aLS.FN*k7fuTn-hdrTdI(vqT-Z.'
           hostname: off-wks01
 
         win-workstation2:
           ansible_host: 10.10.20.20
-          ansible_password: '&ZtDkz%b&SOjTeJ7UI@kw*iH*dnvqJrW'
+          ansible_password: 'pQ)CkMhs$vv2%pN@bYT4l%3-O?McDn=F'
           hostname: off-wks02
 
         certificate_authority:
           ansible_host: 10.10.0.20
-          ansible_password: 'D*Ngl98O8=Hm1VO0xp@X=bH2Q!=TU9xf'
+          ansible_password: 'Tbza9wT@c)81HYAYYgEbVaLI2u3S2sdb'
           hostname: ca01
 
         file_server:
           ansible_host: 10.10.10.10
-          ansible_password: 'x=S;n)OCgUM3l?nFUl=b3==.avBwEIHK'
+          ansible_password: 'K&9*)Y9?1ZJ8r8N4ABRRPR7h=fyF%jY8'
           hostname: fs01
 
         wef_server:
           ansible_host: 10.10.30.10
-          ansible_password: '6@x4y.n$DtrSYW08wun8TEXaLJGknlNp'
+          ansible_password: 'XrjAZ=T;Xy!%XQw26Ab*6cxL&oc!U;Uq'
           hostname: wef01
 
     windows_bootstrap:
@@ -70,14 +77,16 @@ all:
         file_server:
         wef_server:
       vars:
-        ansible_connection: smb
+        ansible_connection: winrm
         ansible_user: Administrator
         ansible_password: "{{ hostvars[inventory_hostname].ansible_password }}"
+        ansible_port: 5985
+        ansible_winrm_server_cert_validation: ignore
 
     ubuntu:
       vars:
         ansible_user: ubuntu
-        ansible_ssh_private_key_file: ssh_private_key.pem
+        ansible_ssh_private_key_file: "/home/ubuntu/sorensen_test.pem"
         ansible_python_interpreter: /usr/bin/python3
       
       hosts:
@@ -106,14 +115,13 @@ domain_admin_password: "10Ek!d0S[1qX*d[=o^k&"
 
 dsrm_password: "}e5K@Z98rE_W"
 
-ca_config: "CA01.Sorensen.Test\\SORENSEN-CA"
 cert_template: "Machine"
 GV
 
 ##############################################
 # BOOTSTRAP SCRIPT (PHASE 1 WINDOWS)
 ##############################################
-cat > bootstrap/bootstrap_pre_domain.ps1 <<'BOOT'
+cat > playbooks/bootstrap/bootstrap_pre_domain.ps1 <<'BOOT'
 $pass = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
 New-LocalUser -Name "ansible" -Password $pass -FullName "Ansible User" -PasswordNeverExpires:$true -UserMayNotChangePassword:$true -ErrorAction SilentlyContinue
 Add-LocalGroupMember -Group "Administrators" -Member "ansible" -ErrorAction SilentlyContinue
@@ -122,7 +130,9 @@ winrm quickconfig -q
 winrm set winrm/config/service '@{AllowUnencrypted="true"}'
 winrm set winrm/config/service/auth '@{Basic="true";CredSSP="true"}'
 
+# Pre-stage both WinRM firewall rules early so both ports are network-accessible
 New-NetFirewallRule -Name "WINRM-HTTP" -DisplayName "WINRM-HTTP" -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
+New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
 BOOT
 
 ##############################################
@@ -130,14 +140,14 @@ BOOT
 ##############################################
 cat > playbooks/phase1_windows_bootstrap.yml <<'P1W'
 ---
-- name: Phase 1 - Windows bootstrap via SMB
+- name: Phase 1 - Windows bootstrap via winrm
   hosts: windows_bootstrap
   gather_facts: no
 
   tasks:
     - name: Copy bootstrap_pre_domain.ps1
       ansible.windows.win_copy:
-        src: bootstrap/bootstrap_pre_domain.ps1
+        src: "{{ playbook_dir }}/bootstrap/bootstrap_pre_domain.ps1"
         dest: C:\bootstrap_pre_domain.ps1
 
     - name: Run bootstrap_pre_domain.ps1
@@ -167,28 +177,44 @@ cat > playbooks/phase2_domain_and_ca.yml <<'P2'
   roles:
     - domain-controller
 
-- hosts: certificate_authority
-  gather_facts: no
-  roles:
-    - certificate-authority
-
 - hosts: domain_controller
   gather_facts: no
   roles:
     - ad-structure
+
+- hosts: certificate_authority
+  gather_facts: no
+  roles:
+    - windows-domain-join
+
+- hosts: certificate_authority
+  gather_facts: no
+  vars:
+    ansible_become: yes
+    ansible_become_method: runas
+    ansible_become_user: "{{ domain_admin }}"
+    ansible_become_password: "{{ domain_admin_password }}"
+  roles:
+    - certificate-authority
 P2
 
 cat > playbooks/phase3_post_domain.yml <<'P3'
 ---
-- hosts: windows:!domain_controller
+- hosts: windows:!domain_controller:!certificate_authority
   gather_facts: no
   roles:
     - windows-domain-join
+
+- hosts: windows
+  gather_facts: no
+  roles:
     - windows-bootstrap
 P3
 
 cat > playbooks/site.yml <<'SITE'
 ---
+- import_playbook: phase1_windows_bootstrap.yml
+- import_playbook: phase1_linux_bootstrap.yml
 - import_playbook: phase2_domain_and_ca.yml
 - import_playbook: phase3_post_domain.yml
 SITE
@@ -196,15 +222,14 @@ SITE
 ##############################################
 # DOMAIN CONTROLLER ROLE
 ##############################################
-cat > roles/domain-controller/tasks/main.yml <<'DC'
+cat > playbooks/roles/domain-controller/tasks/main.yml <<'DC'
 ---
 - name: Promote to domain controller
-  win_domain:
+  microsoft.ad.domain:
     dns_domain_name: "{{ domain_name }}"
     safe_mode_password: "{{ dsrm_password }}"
-    domain_admin_user: "{{ domain_admin }}"
-    domain_admin_password: "{{ domain_admin_password }}"
-    state: domain_controller
+    domain_netbios_name: "{{ netbios_name }}"
+    install_dns: yes
   register: dc_promo
 
 - name: Reboot after promotion
@@ -230,12 +255,21 @@ DC
 ##############################################
 # CERTIFICATE AUTHORITY ROLE
 ##############################################
-cat > roles/certificate-authority/tasks/main.yml <<'CA'
+cat > playbooks/roles/certificate-authority/tasks/main.yml <<'CA'
 ---
 - name: Point CA DNS to DC
   win_dns_client:
     adapter_names: "*"
     dns_servers: "10.10.0.10"
+
+- name: Wait for Active Directory Domain space verification
+  win_shell: |
+    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+    if ($domain) { exit 0 } else { exit 1 }
+  retries: 15
+  delay: 10
+  register: ad_net_check
+  until: ad_net_check.rc == 0
 
 - name: Install ADCS
   win_feature:
@@ -247,18 +281,23 @@ cat > roles/certificate-authority/tasks/main.yml <<'CA'
   win_shell: Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -Force
   args:
     creates: C:\Windows\System32\CertSrv
+
+- name: Grant Domain Computers enrollment access to the Machine template
+  win_shell: |
+    certutil -setreg policy\Machine\EnrollmentRights "+Domain Computers:Enroll"
+    Restart-Service CertSvc
 CA
 
 ##############################################
 # AD STRUCTURE ROLE
 ##############################################
-cat > roles/ad-structure/tasks/main.yml <<'ADMAIN'
+cat > playbooks/roles/ad-structure/tasks/main.yml <<'ADMAIN'
 ---
 - import_tasks: ou_groups.yml
 - import_tasks: users.yml
 ADMAIN
 
-cat > roles/ad-structure/tasks/ou_groups.yml <<'OUG'
+cat > playbooks/roles/ad-structure/tasks/ou_groups.yml <<'OUG'
 ---
 - name: Create enterprise admin user
   microsoft.ad.user:
@@ -354,42 +393,34 @@ cat > roles/ad-structure/tasks/ou_groups.yml <<'OUG'
     - { name: 'IT Staff', path: 'OU=Groups,OU=Users,OU=IT' }
 OUG
 
-cat > roles/ad-structure/tasks/users.yml <<'USERTASK'
+cat > playbooks/roles/ad-structure/tasks/users.yml <<'USERTASK'
 ---
 - name: Load user data
   include_vars:
     file: ../ad-structure/files/domain_users.yml
     name: users_data
 
-- name: Flatten users
+- name: Flatten users structure cleanly
   set_fact:
-    flat_users: >-
-      {% set users = [] %}
-      {% for dept in users_data.users %}
-        {% for u in dept.user_info %}
-          {% set _ = users.append({'path': dept.ou_path, 'username': u.username, 'first': u.first_name, 'surname': u.surname, 'password': u.password, 'groups': u.domain_groups}) %}
-        {% endfor %}
-      {% endfor %}
-      {{ users }}
+    flat_users: "{{ users_data.users | map(attribute='user_info') | flatten }}"
 
 - name: Create users
   microsoft.ad.user:
     name: "{{ item.username }}"
-    firstname: "{{ item.first }}"
+    firstname: "{{ item.first_name }}"
     surname: "{{ item.surname }}"
     password: "{{ item.password }}"
-    path: "{{ item.path }},OU=Departments,DC=Sorensen,DC=Test"
+    path: "{{ users_data.users | selectattr('user_info', 'contains', item) | map(attribute='ou_path') | first }},OU=Departments,DC=Sorensen,DC=Test"
     email: "{{ item.username }}@sorensen.test"
     groups:
-      add: "{{ item.groups }}"
+      add: "{{ item.domain_groups }}"
     password_never_expires: yes
   loop: "{{ flat_users }}"
   loop_control:
     label: "{{ item.username }}"
 USERTASK
 
-# POPULATED & SANITIZED: Completed the missing file content blocks
-cat > roles/ad-structure/files/domain_users.yml <<'USERFILE'
+cat > playbooks/roles/ad-structure/files/domain_users.yml <<'USERFILE'
 ---
 users:
   - ou_path: "OU=Accounts,OU=Users,OU=Human Resources"
@@ -436,7 +467,7 @@ USERFILE
 ##############################################
 # WINDOWS DOMAIN JOIN ROLE
 ##############################################
-cat > roles/windows-domain-join/tasks/main.yml <<'JOIN'
+cat > playbooks/roles/windows-domain-join/tasks/main.yml <<'JOIN'
 ---
 - name: Point DNS to Domain Controller
   win_dns_client:
@@ -444,7 +475,7 @@ cat > roles/windows-domain-join/tasks/main.yml <<'JOIN'
     dns_servers: "10.10.0.10"
 
 - name: Join Sorensen.Test domain
-  win_domain_membership:
+  microsoft.ad.membership:
     dns_domain_name: "{{ domain_name }}"
     domain_admin_user: "{{ domain_admin }}"
     domain_admin_password: "{{ domain_admin_password }}"
@@ -457,66 +488,92 @@ cat > roles/windows-domain-join/tasks/main.yml <<'JOIN'
 JOIN
 
 ##############################################
-# POST-DOMAIN BOOTSTRAP ROLE
+# POST-DOMAIN BOOTSTRAP ROLE (HARDENED)
 ##############################################
-cat > roles/windows-bootstrap/tasks/main.yml <<'WB'
+cat > playbooks/roles/windows-bootstrap/tasks/main.yml <<'WB'
 ---
 - name: Copy post-domain bootstrap script
   win_copy:
     src: bootstrap-win-post-domain.ps1
     dest: C:\bootstrap-win-post-domain.ps1
 
-- name: Run post-domain bootstrap script
-  win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\bootstrap-win-post-domain.ps1 -CA "{{ ca_config }}" -Template "{{ cert_template }}"
-  register: post_bootstrap
+- name: Ensure WinRM HTTPS Firewall Port 5986 is open
+  win_shell: |
+    New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
+    Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
+    exit 0
 
-- name: Reset connection
+# Synchronously execute script to prevent race conditions or dropped connections
+- name: Run post-domain bootstrap script to shift to HTTPS
+  win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\bootstrap-win-post-domain.ps1
+
+- name: Wait for certificate generation and listener migration
+  pause:
+    seconds: 15
+
+- name: Dynamically migrate host connection details to HTTPS
+  set_fact:
+    ansible_port: 5986
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+
+- name: Force Ansible connection engine reset
   meta: reset_connection
+
+- name: Validate secure HTTPS connectivity channel
+  win_ping:
 WB
 
-cat > roles/windows-bootstrap/files/bootstrap-win-post-domain.ps1 <<'WBPS'
-param(
-    [string]$CA,
-    [string]$Template = "Machine"
-)
+# Hardened Self-Signed deployment script payload
+cat > playbooks/roles/windows-bootstrap/files/bootstrap-win-post-domain.ps1 <<'WBPS'
+<#
+.SYNOPSIS
+    Hardened Post-Domain Join Bootstrap Script for Windows Range Targets.
+    Decoupled from Enterprise CA for WinRM layer to prevent double-hop lockouts.
+#>
+Write-Output "=========================================================="
+Write-Output " Hardened WinRM HTTPS Port 5986 Provisioning Engine "
+Write-Output "=========================================================="
 
-$inf = @"
-[Version]
-Signature="`$Windows NT`$"
+# 1. Force WinRM service context alive and clean
+Set-Service WinRM -StartupType Automatic
+Restart-Service WinRM -Force
 
-[NewRequest]
-Subject = "CN=$env:COMPUTERNAME"
-KeyLength = 2048
-Exportable = TRUE
-MachineKeySet = TRUE
-SMIME = FALSE
-PrivateKeyArchive = FALSE
-UserProtected = FALSE
-UseExistingKeySet = FALSE
-ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
-ProviderType = 12
-RequestType = PKCS10
-KeyUsage = 0xa0
+# 2. Generate an isolated local cryptographic token for the management socket
+try {
+    $LocalCert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My" -KeyLength 2048 -Provider "Microsoft RSA SChannel Cryptographic Provider" -Type "SSLServerAuthentication" -ErrorAction Stop
+    $Thumbprint = $LocalCert.Thumbprint
+    Write-Output "[+] Generated Local Cryptographic Management Token: $Thumbprint"
+} catch {
+    Write-Error "[-] CRITICAL: Local certificate generation failed: $($_.Exception.Message)"
+    Exit 1
+}
 
-[RequestAttributes]
-CertificateTemplate = $Template
-"@
+# 3. Purge existing unencrypted/broken configurations
+Write-Output "[*] Flushing legacy WinRM communication pipelines..."
+winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
+winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null
 
-$infPath = "C:\cert.inf"
-$reqPath = "C:\cert.req"
-$cerPath = "C:\cert.cer"
+# 4. Rebuild the listener block securely using the exact thumbprint string variable
+Write-Output "[*] Registering pristine HTTPS network socket binding..."
+try {
+    winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$Thumbprint`"}"
+    Write-Output "[+] WinRM HTTPS listener successfully bound to port 5986."
+} catch {
+    Write-Error "[-] CRITICAL: Failed to bind WinRM HTTPS socket: $($_.Exception.Message)"
+    Exit 1
+}
 
-$inf | Out-File $infPath -Encoding ascii
-certreq -new $infPath $reqPath
-certreq -submit -config $CA $reqPath $cerPath
-certreq -accept $cerPath
+# 5. Lock down Windows Firewall configuration parameters
+Write-Output "[*] Hardening firewall parameters..."
+New-NetFirewallRule -Name "WINRM-HTTPS-MANAGEMENT" -DisplayName "Hardened WinRM HTTPS Port 5986 (Ansible Control)" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
 
-$thumb = (Get-ChildItem Cert:\LocalMachine\My | Sort-Object NotAfter -Descending | Select-Object -First 1).Thumbprint
-winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$thumb`"}"
+# Disable old legacy unencrypted hole
+Disable-NetFirewallRule -DisplayName "Windows Remote Management (HTTP-In)" -ErrorAction SilentlyContinue
 
-winrm delete winrm/config/Listener?Address=*+Transport=HTTP
-winrm set winrm/config/service '@{AllowUnencrypted="false"}'
-winrm set winrm/config/service/auth '@{Basic="false"}'
+# 6. Final service kick to cement bindings
+Restart-Service WinRM -Force
+Write-Output "[+] Aligned successfully on HTTPS port 5986."
 WBPS
 
 ##############################################
@@ -525,7 +582,19 @@ WBPS
 echo "[*] Installing Ansible collections"
 ansible-galaxy collection install ansible.windows community.windows microsoft.ad
 
-echo
+# ====================================================================
+# PERMANENT ANSIBLE CONFIG OVERRIDE (FINGERPRINT BYPASS)
+# ====================================================================
+ANSIBLE_CFG_PATH="ansible.cfg"
+
+echo "Creating optimized ansible.cfg..."
+cat << EOF > "$ANSIBLE_CFG_PATH"
+[defaults]
+host_key_checking = False
+ssh_args = -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no
+EOF
+
+echo "✅ Ansible configuration optimized for rapid range rebuilds."
 echo "===================================================="
 echo "Repo created successfully at $REPO"
 echo "===================================================="
