@@ -1,0 +1,26 @@
+# ==============================================================================
+# WINDOWS WINRM & NETWORK BOOTSTRAP UNLOCK
+# Run this inside an Administrative PowerShell console on each target host.
+# ==============================================================================
+
+Write-Output "[*] Starting initial Windows automation unlock..."
+
+# 1. Disable the Remote UAC Local Account Token Filter Restriction
+# Allows local Administrator credentials to be trusted over remote network connections
+New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "LocalAccountTokenFilterPolicy" -Value 1 -PropertyType DWord -Force
+
+# 2. Change all active network interface profiles from Public to Private
+# Stops Windows from dropping remote management traffic due to untrusted network classifications
+Get-NetConnectionProfile | Where-Object {$_.NetworkCategory -eq "Public"} | Set-NetConnectionProfile -NetworkCategory Private
+
+# 3. Configure WinRM service to allow unencrypted basic authentication for initial bootstrapping
+winrm set winrm/config/service/auth '@{Basic="true"}'
+winrm set winrm/config/service '@{AllowUnencrypted="true"}'
+
+# 4. Explicitly ensure the inbound Windows Firewall rules are open for port 5985
+New-NetFirewallRule -Name "Allow_WinRM_5985" -DisplayName "Ansible WinRM Inbound" -Protocol TCP -LocalPort 5985 -Action Allow -Profile Any -ErrorAction SilentlyContinue
+
+# 5. Restart the WinRM service to apply all configuration layers cleanly
+Restart-Service -Name WinRM -Force
+
+Write-Output "[+] Success! Host network interfaces are set to Private and WinRM is ready for Ansible."
