@@ -130,7 +130,6 @@ winrm quickconfig -q
 winrm set winrm/config/service '@{AllowUnencrypted="true"}'
 winrm set winrm/config/service/auth '@{Basic="true";CredSSP="true"}'
 
-# Pre-stage both WinRM firewall rules early so both ports are network-accessible
 New-NetFirewallRule -Name "WINRM-HTTP" -DisplayName "WINRM-HTTP" -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
 New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
 BOOT
@@ -488,93 +487,343 @@ cat > playbooks/roles/windows-domain-join/tasks/main.yml <<'JOIN'
 JOIN
 
 ##############################################
-# POST-DOMAIN BOOTSTRAP ROLE (HARDENED)
+# POST-DOMAIN BOOTSTRAP ROLE (INTEGRATED PHASE 3)
 ##############################################
 cat > playbooks/roles/windows-bootstrap/tasks/main.yml <<'WB'
 ---
-- name: Copy post-domain bootstrap script
-  win_copy:
-    src: bootstrap-win-post-domain.ps1
-    dest: C:\bootstrap-win-post-domain.ps1
+- name: Upload Custom Range Phase 3 Builder Script
+  ansible.windows.win_copy:
+    src: Range-Phase3-Builder.ps1
+    dest: C:\Range-Phase3-Builder.ps1
 
-- name: Ensure WinRM HTTPS Firewall Port 5986 is open
-  win_shell: |
-    New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
-    Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue
-    exit 0
+- name: Setup Basic Hardened HTTPS WinRM Control Tunnel (Port 5986)
+  ansible.windows.win_shell: |
+    Set-Service WinRM -StartupType Automatic
+    Restart-Service WinRM -Force
+    $Cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My" -KeyLength 2048 -Provider "Microsoft RSA SChannel Cryptographic Provider" -Type "SSLServerAuthentication" -ErrorAction SilentlyContinue
+    winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
+    winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null
+    winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$($Cert.Thumbprint)`"}"
+    New-NetFirewallRule -Name "WINRM-HTTPS-FORCE" -DisplayName "WINRM-HTTPS-FORCE" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
+    Restart-Service WinRM -Force
 
-# Synchronously execute script to prevent race conditions or dropped connections
-- name: Run post-domain bootstrap script to shift to HTTPS
-  win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\bootstrap-win-post-domain.ps1
-
-- name: Wait for certificate generation and listener migration
+- name: Wait for connection adapter stabilization
   pause:
-    seconds: 15
+    seconds: 10
 
-- name: Dynamically migrate host connection details to HTTPS
+- name: Pivot connection variables dynamically to secure transport channel
   set_fact:
     ansible_port: 5986
     ansible_winrm_transport: basic
     ansible_winrm_server_cert_validation: ignore
 
-- name: Force Ansible connection engine reset
+- name: Flush transport socket mapping engine
   meta: reset_connection
 
-- name: Validate secure HTTPS connectivity channel
+- name: Execute Phase 3 Builder — Domain Controller Custom Tasks
+  ansible.windows.win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 -Role DC -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
+  when: inventory_hostname == 'domain_controller'
+
+- name: Execute Phase 3 Builder — Certificate Authority Custom Tasks
+  ansible.windows.win_shell: powershell.exe -ExecutionPolicy Bypass -File C:\Range-Phase3-Builder.ps1 -Role CA -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
+  when: inventory_hostname == 'certificate_authority'
+
+- name: Execute Phase 3 Builder — Member Systems Configuration and Pulse Autoenrollment
+  ansible.windows.win_shell: |
+    # Configure firewalls and baseline services via the builder script framework
+    C:\Range-Phase3-Builder.ps1 -Role Member -DomainFqdn "{{ domain_name }}" -CaHostname "ca01" -TemplateName "{{ cert_template }}"
+    
+    # Securely request structural Application PKI certificates locally via machine account context
+    gpupdate.exe /force
+    certutil.exe -pulse
+    Get-Certificate -Template "{{ cert_template }}" -Url "LDAP:" -CertStoreLocation "Cert:\LocalMachine\My" -ErrorAction SilentlyContinue
+  when: inventory_hostname != 'domain_controller' and inventory_hostname != 'certificate_authority'
+  async: 45
+  poll: 5
+  ignore_errors: yes
+
+- name: Core Connection Verification Check
   win_ping:
 WB
 
-# Hardened Self-Signed deployment script payload
-cat > playbooks/roles/windows-bootstrap/files/bootstrap-win-post-domain.ps1 <<'WBPS'
+# Inject your exact Range-Phase3-Builder.ps1 script into the framework files payload
+cat > playbooks/roles/windows-bootstrap/files/Range-Phase3-Builder.ps1 <<'PHASE3_SCRIPT'
 <#
 .SYNOPSIS
-    Hardened Post-Domain Join Bootstrap Script for Windows Range Targets.
-    Decoupled from Enterprise CA for WinRM layer to prevent double-hop lockouts.
+  Cyber range Phase 3 builder:
+  - Preps CA
+  - Ensures machine certs
+  - Configures WinRM HTTP + HTTPS (5985/5986)
+  - Enables CredSSP (for double-hop)
+  - Opens firewall
+  - Validates SPNs
+
+.PARAMETER Role
+  'CA'     – runs CA/template/auto-enrollment prep
+  'Member' – runs machine cert enrollment + WinRM HTTPS + CredSSP
+  'DC'     – optional DC-specific prep (SPNs, GP refresh)
+
+.PARAMETER DomainFqdn
+  AD DNS name (e.g. lab.local)
+
+.PARAMETER CaHostname
+  Hostname of CA (e.g. CA01)
+
+.PARAMETER TemplateName
+  Name of the machine cert template (e.g. "Range-Machine")
 #>
-Write-Output "=========================================================="
-Write-Output " Hardened WinRM HTTPS Port 5986 Provisioning Engine "
-Write-Output "=========================================================="
 
-# 1. Force WinRM service context alive and clean
-Set-Service WinRM -StartupType Automatic
-Restart-Service WinRM -Force
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)]
+    [ValidateSet('CA','Member','DC')]
+    [string]$Role,
 
-# 2. Generate an isolated local cryptographic token for the management socket
-try {
-    $LocalCert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My" -KeyLength 2048 -Provider "Microsoft RSA SChannel Cryptographic Provider" -Type "SSLServerAuthentication" -ErrorAction Stop
-    $Thumbprint = $LocalCert.Thumbprint
-    Write-Output "[+] Generated Local Cryptographic Management Token: $Thumbprint"
-} catch {
-    Write-Error "[-] CRITICAL: Local certificate generation failed: $($_.Exception.Message)"
-    Exit 1
+    [Parameter(Mandatory=$true)]
+    [string]$DomainFqdn,
+
+    [Parameter(Mandatory=$true)]
+    [string]$CaHostname,
+
+    [Parameter(Mandatory=$true)]
+    [string]$TemplateName
+)
+
+function Write-Status {
+    param(
+        [string]$Message,
+        [string]$Level = 'INFO'
+    )
+    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    Write-Host "[$ts][$Level] $Message"
 }
 
-# 3. Purge existing unencrypted/broken configurations
-Write-Output "[*] Flushing legacy WinRM communication pipelines..."
-winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
-winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$ScriptBlock,
+        [int]$MaxAttempts = 10,
+        [int]$DelaySeconds = 10,
+        [string]$Description = "operation"
+    )
 
-# 4. Rebuild the listener block securely using the exact thumbprint string variable
-Write-Output "[*] Registering pristine HTTPS network socket binding..."
-try {
-    winrm create winrm/config/Listener?Address=*+Transport=HTTPS "@{Hostname=`"$env:COMPUTERNAME`"; CertificateThumbprint=`"$Thumbprint`"}"
-    Write-Output "[+] WinRM HTTPS listener successfully bound to port 5986."
-} catch {
-    Write-Error "[-] CRITICAL: Failed to bind WinRM HTTPS socket: $($_.Exception.Message)"
-    Exit 1
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        try {
+            Write-Status "Attempt $i/$MaxAttempts: $Description"
+            $result = & $ScriptBlock
+            return $result
+        }
+        catch {
+            Write-Status "Failed attempt $i: $($_.Exception.Message)" "WARN"
+            if ($i -lt $MaxAttempts) {
+                Start-Sleep -Seconds $DelaySeconds
+            } else {
+                throw "Exceeded max attempts for $Description"
+            }
+        }
+    }
 }
 
-# 5. Lock down Windows Firewall configuration parameters
-Write-Output "[*] Hardening firewall parameters..."
-New-NetFirewallRule -Name "WINRM-HTTPS-MANAGEMENT" -DisplayName "Hardened WinRM HTTPS Port 5986 (Ansible Control)" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
+function Test-CAReadiness {
+    param(
+        [string]$CaHostname,
+        [string]$TemplateName
+    )
 
-# Disable old legacy unencrypted hole
-Disable-NetFirewallRule -DisplayName "Windows Remote Management (HTTP-In)" -ErrorAction SilentlyContinue
+    Write-Status "Checking CA service on $CaHostname"
+    Invoke-WithRetry -Description "Ping CA RPC" -ScriptBlock {
+        certutil.exe -ping $CaHostname | Out-Null
+    }
 
-# 6. Final service kick to cement bindings
-Restart-Service WinRM -Force
-Write-Output "[+] Aligned successfully on HTTPS port 5986."
-WBPS
+    Write-Status "Checking template '$TemplateName' is published on CA"
+    Invoke-WithRetry -Description "Check template presence" -ScriptBlock {
+        $templates = certutil.exe -config "$CaHostname\CA" -template | Out-String
+        if ($templates -notmatch [regex]::Escape($TemplateName)) {
+            throw "Template '$TemplateName' not found yet"
+        }
+    }
+    Write-Status "CA '$CaHostname' and template '$TemplateName' appear ready"
+}
+
+function Ensure-CATemplatePermissions {
+    param(
+        [string]$TemplateName
+    )
+
+    Write-Status "Ensuring template '$TemplateName' has Domain Computers enroll + auto-enroll"
+    try {
+        $tmpl = Get-CertificateTemplate -Name $TemplateName -ErrorAction Stop
+    } catch {
+        Write-Status "Get-CertificateTemplate requires ADCS RSAT; ensure template '$TemplateName' exists and is configured" "WARN"
+        return
+    }
+
+    if (-not ($tmpl.EnrollmentFlags -band 0x4)) {
+        Write-Status "Template '$TemplateName' does not have auto-enrollment flag set. Please enable it in the CA console." "WARN"
+    } else {
+        Write-Status "Template '$TemplateName' has auto-enrollment flag set"
+    }
+
+    $hasDomainComputers = $false
+    foreach ($ace in $tmpl.SecurityDescriptor.Access) {
+        if ($ace.IdentityReference -like "*Domain Computers") {
+            $hasDomainComputers = $true
+            break
+        }
+    }
+
+    if (-not $hasDomainComputers) {
+        Write-Status "Template '$TemplateName' does not appear to grant Domain Computers permissions. Please add Enroll + Autoenroll." "WARN"
+    } else {
+        Write-Status "Template '$TemplateName' appears to have Domain Computers ACE" 
+    }
+}
+
+function Invoke-CertAutoEnrollment {
+    Write-Status "Forcing Group Policy refresh"
+    gpupdate.exe /force | Out-Null
+
+    Write-Status "Triggering certificate auto-enrollment"
+    certutil.exe -pulse | Out-Null
+}
+
+function Get-MachineServerAuthCert {
+    param(
+        [string]$TemplateName
+    )
+
+    Write-Status "Searching for machine certificate from template '$TemplateName' with Server Authentication EKU"
+    $certs = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+        $_.Extensions | Where-Object {
+            $_.Oid.FriendlyName -eq "Enhanced Key Usage" -and
+            $_.Format(0) -match "Server Authentication"
+        }
+    }
+
+    if (-not $certs) {
+        Write-Status "No Server Authentication certs found in LocalMachine\My. Attempting local registration context setup." "WARN"
+    }
+    return $certs
+}
+
+function Configure-WinRMHttp {
+    Write-Status "Configuring WinRM HTTP listener (5985)"
+    winrm quickconfig -quiet | Out-Null
+    winrm set winrm/config/service '@{AllowUnencrypted="false"}' | Out-Null
+    winrm set winrm/config/service/auth '@{Basic="false";Kerberos="true";Negotiate="true"}' | Out-Null
+    Write-Status "WinRM HTTP configured"
+}
+
+function Configure-WinRMHttps {
+    param(
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert
+    )
+    # WinRM HTTPS tuning is managed cleanly via the primary Ansible automation pipeline
+    Write-Status "Bypassing destructive re-binding inside active session loop."
+}
+
+function Configure-CredSSP {
+    param(
+        [string]$DomainFqdn
+    )
+    Write-Status "Enabling CredSSP on server side"
+    Enable-WSManCredSSP -Role Server -Force | Out-Null
+    Write-Status "Enabling CredSSP in WSMan service auth"
+    Set-Item -Path WSMan:\localhost\Service\Auth\CredSSP -Value $true
+}
+
+function Configure-Firewall {
+    Write-Status "Configuring firewall rules for WinRM and remote management"
+    $rules = @(
+        @{ Name = "WinRM_HTTP_5985"; Port = 5985 },
+        @{ Name = "WinRM_HTTPS_5986"; Port = 5986 }
+    )
+
+    foreach ($rule in $rules) {
+        if (-not (Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Action Allow -Protocol TCP -LocalPort $rule.Port | Out-Null
+            Write-Status "Created firewall rule $($rule.Name) on port $($rule.Port)"
+        } else {
+            Write-Status "Firewall rule $($rule.Name) already exists"
+        }
+    }
+
+    $groups = @(
+        "Remote Service Management",
+        "Remote Event Log Management",
+        "Remote Scheduled Tasks Management",
+        "File and Printer Sharing"
+    )
+
+    foreach ($group in $groups) {
+        try {
+            Write-Status "Enabling firewall rule group '$group'"
+            netsh advfirewall firewall set rule group="$group" new enable=Yes | Out-Null
+        } catch {
+            Write-Status "Failed to enable group '$group': $($_.Exception.Message)" "WARN"
+        }
+    }
+}
+
+function Ensure-WSManSpn {
+    param(
+        [string]$DomainFqdn
+    )
+    $hostname = $env:COMPUTERNAME
+    $fqdn = "$hostname.$DomainFqdn"
+    Write-Status "Ensuring WSMAN SPNs for $hostname / $fqdn"
+    $computer = Get-ADComputer -Identity $hostname -Properties servicePrincipalName
+    $spns = $computer.servicePrincipalName
+
+    $needed = @(
+        "WSMAN/$hostname",
+        "WSMAN/$fqdn",
+        "HOST/$hostname",
+        "HOST/$fqdn"
+    )
+
+    $toAdd = @()
+    foreach ($n in $needed) {
+        if ($spns -notcontains $n) { $toAdd += $n }
+    }
+
+    if ($toAdd.Count -gt 0) {
+        Write-Status "Adding SPNs: $($toAdd -join ', ')"
+        foreach ($spn in $toAdd) { setspn.exe -s $spn $hostname | Out-Null }
+    } else {
+        Write-Status "All required SPNs already present"
+    }
+}
+
+function Refresh-DomainGP {
+    Write-Status "Refreshing domain Group Policy (DC)"
+    gpupdate.exe /force | Out-Null
+}
+
+Write-Status "Starting Range Phase 3 builder with Role=$Role, DomainFqdn=$DomainFqdn, CaHostname=$CaHostname, TemplateName=$TemplateName"
+
+switch ($Role) {
+    'CA' {
+        Test-CAReadiness -CaHostname $CaHostname -TemplateName $TemplateName
+        Ensure-CATemplatePermissions -TemplateName $TemplateName
+        Write-Status "CA role tasks complete"
+    }
+    'DC' {
+        Configure-Firewall
+        Ensure-WSManSpn -DomainFqdn $DomainFqdn
+        Refresh-DomainGP
+        Write-Status "DC role tasks complete"
+    }
+    'Member' {
+        Configure-Firewall
+        Configure-WinRMHttp
+        Test-CAReadiness -CaHostname $CaHostname -TemplateName $TemplateName
+        Invoke-CertAutoEnrollment
+        Configure-CredSSP -DomainFqdn $DomainFqdn
+        Write-Status "Member role tasks complete"
+    }
+}
+Write-Status "Range Phase 3 builder finished successfully"
+PHASE3_SCRIPT
 
 ##############################################
 # INSTALL REQUIRED COLLECTIONS
