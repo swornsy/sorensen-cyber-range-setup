@@ -1,0 +1,29 @@
+# ============================
+# PHASE 1 — WINDOWS BOOTSTRAP
+# ============================
+ansible-playbook -i inventory/hosts.yml playbooks/phase1_windows_bootstrap.yml
+
+# ============================
+# PHASE 1 — LINUX BOOTSTRAP
+# ============================
+ansible-playbook -i inventory/hosts.yml playbooks/phase1_linux_bootstrap.yml
+
+# ============================
+# PHASE 2 — DOMAIN + CA + AD STRUCTURE + USERS
+# ============================
+ansible-playbook -i inventory/hosts.yml playbooks/phase2_domain_and_ca.yml
+
+# ============================
+# PHASE 3 — DOMAIN JOIN + CERTS + WINRM HTTPS
+# ============================
+ansible-playbook -i inventory/hosts.yml playbooks/phase3_post_domain.yml
+
+# ============================
+# PHASE 4 — LOGGING PIPELINE (SYSMON → WEF → WINLOGBEAT → ELK)
+# ============================
+ansible-playbook -i inventory/hosts.yml playbooks/phase4_logging.yml
+
+# ============================
+# PHASE 6 — ATOMIC RED TEAM ATTACK SIMULATION
+# ============================
+ansible-playbook -i inventory/hosts.yml playbooks/phase6_atomic_red_team.yml
