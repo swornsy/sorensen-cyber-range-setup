@@ -119,19 +119,40 @@ cert_template: "Machine"
 GV
 
 ##############################################
-# BOOTSTRAP SCRIPT (PHASE 1 WINDOWS)
+# BOOTSTRAP SCRIPT (PHASE 1 WINDOWS) - OPTIMIZED
 ##############################################
 cat > playbooks/bootstrap/bootstrap_pre_domain.ps1 <<'BOOT'
+# 1. Create a dedicated Ansible local administrator account
 $pass = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
 New-LocalUser -Name "ansible" -Password $pass -FullName "Ansible User" -PasswordNeverExpires:$true -UserMayNotChangePassword:$true -ErrorAction SilentlyContinue
 Add-LocalGroupMember -Group "Administrators" -Member "ansible" -ErrorAction SilentlyContinue
 
+# 2. Hardcode DNS server targeting to prevent domain resolution lookup loops
+# Every host points to the DC (10.10.0.10), except the DC itself which can use a loopback or gateway
+$ipConfig = Get-NetIPAddress -InterfaceAddress "10.10.0.10" -ErrorAction SilentlyContinue
+if ($ipConfig) {
+    Write-Output "[*] Running on DC: Setting DNS to loopback"
+    Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Set-InterfaceMetric -InterfaceMetric 15 -ErrorAction SilentlyContinue
+    Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Set-DnsClientServerAddress -ServerAddresses ("127.0.0.1") -ErrorAction SilentlyContinue
+} else {
+    Write-Output "[*] Running on Endpoint/CA: Forcing Primary DNS to Domain Controller"
+    Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Set-DnsClientServerAddress -ServerAddresses ("10.10.0.10") -ErrorAction SilentlyContinue
+}
+
+# 3. Clean and purge any broken, pre-existing WinRM configurations
+Stop-Service WinRM -ErrorAction SilentlyContinue
+winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
+winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null
+
+# 4. Spin up a fresh, pristine baseline HTTP listener for Phase 1/2 automation
 winrm quickconfig -q
 winrm set winrm/config/service '@{AllowUnencrypted="true"}'
 winrm set winrm/config/service/auth '@{Basic="true";CredSSP="true"}'
+Start-Service WinRM -ErrorAction SilentlyContinue
 
-New-NetFirewallRule -Name "WINRM-HTTP" -DisplayName "WINRM-HTTP" -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
-New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -ErrorAction SilentlyContinue
+# 5. Punch precise inbound holes through the Windows Defender Firewall
+New-NetFirewallRule -Name "WINRM-HTTP" -DisplayName "WINRM-HTTP" -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
+New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
 BOOT
 
 ##############################################
