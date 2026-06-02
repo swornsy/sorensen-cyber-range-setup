@@ -119,38 +119,39 @@ cert_template: "Machine"
 GV
 
 ##############################################
-# BOOTSTRAP SCRIPT (PHASE 1 WINDOWS) - OPTIMIZED
+# BOOTSTRAP SCRIPT (PHASE 1 WINDOWS)
 ##############################################
 cat > playbooks/bootstrap/bootstrap_pre_domain.ps1 <<'BOOT'
-# 1. Create a dedicated Ansible local administrator account
+# 1. Stand up a dedicated local administrator for Ansible orchestration tasks
 $pass = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
 New-LocalUser -Name "ansible" -Password $pass -FullName "Ansible User" -PasswordNeverExpires:$true -UserMayNotChangePassword:$true -ErrorAction SilentlyContinue
 Add-LocalGroupMember -Group "Administrators" -Member "ansible" -ErrorAction SilentlyContinue
 
-# 2. Hardcode DNS server targeting to prevent domain resolution lookup loops
-# Every host points to the DC (10.10.0.10), except the DC itself which can use a loopback or gateway
-$ipConfig = Get-NetIPAddress -InterfaceAddress "10.10.0.10" -ErrorAction SilentlyContinue
-if ($ipConfig) {
-    Write-Output "[*] Running on DC: Setting DNS to loopback"
-    Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Set-InterfaceMetric -InterfaceMetric 15 -ErrorAction SilentlyContinue
+# 2. DYNAMIC ROLE IDENTIFICATION (Your integrated check converted to a clean Boolean)
+$IsDC = [bool](Get-NetIPAddress | Where-Object { $_.IPAddress -eq "10.10.0.10" })
+
+if ($IsDC) {
+    Write-Output "[*] Identified as Domain Controller via Local IP Verification"
+    # Ensure DNS points cleanly to localhost loopback for initial AD DS directory configuration
     Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Set-DnsClientServerAddress -ServerAddresses ("127.0.0.1") -ErrorAction SilentlyContinue
 } else {
-    Write-Output "[*] Running on Endpoint/CA: Forcing Primary DNS to Domain Controller"
+    Write-Output "[*] Identified as Member Workstation/CA via Local IP Verification"
+    # Route all non-DC endpoints straight to the primary domain controller for name resolution
     Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Set-DnsClientServerAddress -ServerAddresses ("10.10.0.10") -ErrorAction SilentlyContinue
 }
 
-# 3. Clean and purge any broken, pre-existing WinRM configurations
+# 3. Recycle and clear old WinRM listeners in-memory to purge ghost configurations safely
 Stop-Service WinRM -ErrorAction SilentlyContinue
 winrm delete winrm/config/Listener?Address=*+Transport=HTTP 2>$null
 winrm delete winrm/config/Listener?Address=*+Transport=HTTPS 2>$null
 
-# 4. Spin up a fresh, pristine baseline HTTP listener for Phase 1/2 automation
+# 4. Bind the fresh, pristine base HTTP port 5985 listener channel
 winrm quickconfig -q
 winrm set winrm/config/service '@{AllowUnencrypted="true"}'
 winrm set winrm/config/service/auth '@{Basic="true";CredSSP="true"}'
 Start-Service WinRM -ErrorAction SilentlyContinue
 
-# 5. Punch precise inbound holes through the Windows Defender Firewall
+# 5. Open strict inbound host firewall filters across all profiles
 New-NetFirewallRule -Name "WINRM-HTTP" -DisplayName "WINRM-HTTP" -Protocol TCP -LocalPort 5985 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
 New-NetFirewallRule -Name "WINRM-HTTPS" -DisplayName "WINRM-HTTPS" -Protocol TCP -LocalPort 5986 -Action Allow -Direction Inbound -Profile Any -ErrorAction SilentlyContinue
 BOOT
